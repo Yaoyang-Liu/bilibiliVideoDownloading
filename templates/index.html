@@ -5,7 +5,7 @@
   <title>Bilibili视频下载器</title>
   <script src="https://cdn.socket.io/4.7.5/socket.io.js"></script>
   <style>
-    /* 保持原有样式不变 */
+    /* 样式保持不变 */
     body {
       font-family: Arial, sans-serif;
       max-width: 800px;
@@ -46,7 +46,7 @@
 
     .progress-container {
       margin: 10px 0;
-      padding: 10px;
+      padding: 8px 10px;
       background-color: #fff;
       border-radius: 5px;
       box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
@@ -54,17 +54,19 @@
 
     .progress-title {
       font-weight: bold;
-      margin-bottom: 5px;
+      margin-bottom: 4px;
       word-break: break-all;
+      line-height: 1.2;
     }
 
-    /* 去掉进度条链接显示相关样式，也可保留但不渲染内容 */
     .progress-url {
-      display: none; /* 直接隐藏该容器 */
-      font-size: 0.8em;
+      display: none;
+    }
+
+    .progress-speed {
+      font-size: 0.85em;
       color: #666;
-      margin-bottom: 5px;
-      word-break: break-all;
+      margin: 3px 0;
     }
 
     .progress-bar {
@@ -78,7 +80,7 @@
 
     .progress-bar-fill {
       display: block;
-      height: 16px;
+      height: 12px;
       background-color: #00a1d6;
       border-radius: 2px;
       transition: width 300ms ease-in-out;
@@ -94,16 +96,12 @@
       margin-top: 10px;
     }
 
-    .success {
-      color: #4CAF50;
-      margin-top: 10px;
-    }
-
     .task-summary {
       margin: 15px 0;
       padding: 4px 10px;
       background-color: #e8f4f8;
       border-radius: 5px;
+      line-height: 1;
     }
 
     .progress-bars-container {
@@ -117,33 +115,84 @@
     <h1>Bilibili视频下载器</h1>
     <p>请输入Bilibili视频链接（多个链接请换行）：</p>
     <textarea id="urls" placeholder="在此粘贴视频链接..."></textarea>
+    <p>选择清晰度：</p>
+    <select id="quality-select">
+      <option value="">加载中...</option>
+    </select>
     <button id="submit" onclick="submitUrls()">开始下载</button>
     <div id="status">
       <div id="task-summary"></div>
       <div class="progress-bars-container" id="progress-bars-container"></div>
+      <div id="network-status" style="color: #666; margin: 10px 0;"></div>
     </div>
   </div>
 
   <script>
+    let isDownloading = false; // 标记当前是否正在下载
+    let taskId; // 当前任务ID
+    
+    function updateNetworkStatus() {
+      const statusEl = document.getElementById('network-status');
+      if (navigator.onLine) {
+        statusEl.textContent = '网络状态：正常';
+        statusEl.style.color = '#4CAF50';
+      } else {
+        statusEl.textContent = '网络状态：已断开（下载已暂停）';
+        statusEl.style.color = '#ff4444';
+      }
+    }
+
+    // 监听网络状态变化
+    window.addEventListener('offline', () => {
+      if (isDownloading) {
+        socket.emit('pause_task', taskId); // 通知后端暂停任务
+        console.log('网络断开，已通知后端暂停下载任务');
+      }
+    });
+
+    window.addEventListener('online', () => {
+      if (isDownloading) {
+        socket.emit('resume_task', taskId); // 通知后端恢复任务
+        console.log('网络恢复，已通知后端恢复下载任务');
+      }
+    });
+
     // 加载清晰度选项
     fetch('/qualities')
-      .then(response => response.json())
-      .then(qualities => {
-        console.log('可用清晰度:', qualities);
+    .then(response => {
+      if (!response.ok) throw new Error('接口请求失败');
+      return response.json();
+    })
+    .then(qualities => {
+      const select = document.getElementById('quality-select');
+      select.innerHTML = ''; // 清空加载提示
+    
+      // 动态添加选项
+      Object.entries(qualities).forEach(([value, name]) => {
+        const option = document.createElement('option');
+        option.value = value;
+        option.textContent = name;
+        select.appendChild(option);
       });
-
+    
+      // 设置默认值（如1080P）
+       select.value = '80';
+    })
+    .catch(error => {
+      console.error('加载清晰度失败:', error);
+      const select = document.getElementById('quality-select');
+      select.innerHTML = '<option value="80">默认1080P</option>'; // 兜底
+    });
+     
     // WebSocket 连接
     const socket = io('http://localhost:5000');
-    socket.on('connect', () => {
-      console.log('✅ WebSocket 已连接');
-    });
-    socket.on('connect_error', (error) => {
-      console.error('❌ 连接失败:', error.message);
-    });
+    socket.on('connect', () => console.log('✅ WebSocket 已连接'));
+    socket.on('connect_error', (error) => console.error('❌ 连接失败:', error));
 
-    // 存储：url -> 进度条信息（关键：保留DOM引用）
+    // 存储：url -> 进度信息（增强版）
     const urlProgressMap = new Map(); 
     let currentTaskId = null;
+    const speedCache = new Map(); 
 
     function submitUrls() {
       const urlsText = document.getElementById('urls').value;
@@ -151,6 +200,11 @@
       const button = document.getElementById('submit');
       const taskSummary = document.getElementById('task-summary');
       const progressContainer = document.getElementById('progress-bars-container');
+      
+      button.disabled = true;
+      isDownloading = true;
+      // 关键修复：获取选中的清晰度值
+      const quality = document.getElementById('quality-select').value;
 
       // 清空历史数据
       urlProgressMap.clear();
@@ -158,62 +212,60 @@
       progressContainer.innerHTML = '';
 
       button.disabled = true;
-      taskSummary.innerHTML = '正在提交下载请求...';
 
-      // 预创建进度条（核心：为每个URL创建并保存DOM）
+      // 预创建进度条（初始化增强）
       urls.forEach(url => {
         const progressBar = createEmptyProgressBar(url);
         progressContainer.appendChild(progressBar);
         urlProgressMap.set(url, {
-          url: url,                  // 保存URL用于匹配
-          dom: progressBar,          // 保存DOM元素引用
+          url: url,
+          dom: progressBar,
           progress: 0,
           status: 'pending',
           title: '等待解析...',
-          error: ''
+          error: '',
+          speed: '等待中...',
+          lastValidSpeed: null, // 初始为null，标记未收到有效速度
+          hasReceivedValidSpeed: false // 是否收到过有效速度
         });
       });
 
-      // 提交任务
+      // 提交任务：修复参数传递，添加quality参数
       fetch('/submit', {
         method: 'POST',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: 'urls=' + encodeURIComponent(urlsText)
+        // 关键修复：在请求体中包含清晰度参数
+        body: `urls=${encodeURIComponent(urlsText)}&quality=${encodeURIComponent(quality)}`
       })
         .then(response => response.json())
         .then(data => {
           if (data.error) {
             taskSummary.innerHTML = `<div class="error">${data.error}</div>`;
             button.disabled = false;
+            isDownloading = false;
+            updateNetworkStatus();
             return;
           }
           currentTaskId = data.task_id;
           socket.emit('subscribe_task', { task_id: currentTaskId });
-          taskSummary.innerHTML = `
-            <div class="task-summary">
-              <!-- 去掉任务ID显示 -->
-              <br>正在准备下载...
-            </div>
-          `;
         })
         .catch(error => {
           taskSummary.innerHTML = `<div class="error">提交失败: ${error.message}</div>`;
           button.disabled = false;
+          isDownloading = false;
         });
     }
 
-    // 创建空进度条，去掉progress-url的内容渲染
     function createEmptyProgressBar(url) {
       const progressBar = document.createElement('div');
       progressBar.className = 'progress-container';
-      // 初始HTML结构（去掉progress-url的内容显示，或直接不渲染该容器）
       progressBar.innerHTML = `
         <div class="progress-title">
           等待解析...
           <span class="progress-percentage">0% (等待中)</span>
         </div>
-        <!-- 去掉链接显示，或者保留空容器并通过样式隐藏 -->
-        <div class="progress-url"></div> 
+        <div class="progress-url">${url}</div>
+        <div class="progress-speed">速度：等待中...</div>
         <div class="progress-bar">
           <span class="progress-bar-fill" style="width: 0%; background-color: #ccc"></span>
         </div>
@@ -221,33 +273,56 @@
       return progressBar;
     }
 
-    // 监听进度更新（核心修复区）
+    // 监听进度更新（核心过滤逻辑）
     socket.on('download_progress', (data) => {
       if (data.task_id !== currentTaskId) return;
       const currentUrl = data.current_url;
-      
-      // 1. 找到对应URL的进度条信息
       const progressInfo = urlProgressMap.get(currentUrl);
-      if (!progressInfo) {
-        console.warn('未找到进度条:', currentUrl);
-        return;
+      if (!progressInfo) return;
+      
+      if (data.status === 'paused') {
+        isDownloading = false; // 标记为暂停状态
+      } else if (data.status === 'resumed') {
+        isDownloading = true; // 标记为继续状态
       }
-
-      // 2. 更新进度数据
+      // 更新基础信息
       progressInfo.progress = data.progress || 0;
       progressInfo.title = data.title || progressInfo.title;
       progressInfo.status = data.status || progressInfo.status;
       progressInfo.error = data.error || '';
 
-      // 3. 直接更新DOM（关键：使用保存的DOM引用，避免重新查找）
-      updateVideoProgress(progressInfo);
+      // 1. 严格过滤有效速度（排除0、空、--）
+      const isSpeedValid = data.speed && 
+                          data.speed !== '0 KB/s' && 
+                          data.speed !== '0 B/s' && 
+                          data.speed !== '--';
 
-      // 更新任务摘要，去掉任务ID显示
-      document.getElementById('task-summary').innerHTML = `
-        <div class="task-summary">
-          <br>总进度: ${data.completed || 0}/${data.total || 0}
-        </div>
-      `;
+      // 2. 首次收到有效速度时强制赋值
+      if (isSpeedValid) {
+        progressInfo.lastValidSpeed = data.speed;
+        progressInfo.hasReceivedValidSpeed = true; // 标记已收到有效速度
+      }
+
+      // 3. 状态锁定：下载中必须显示有效速度（不允许0）
+      let displaySpeed;
+      if (progressInfo.status === 'downloading') {
+        // 已收到过有效速度 → 用lastValidSpeed；否则显示"计算中..."
+        displaySpeed = progressInfo.hasReceivedValidSpeed 
+          ? progressInfo.lastValidSpeed 
+          : '计算中...';
+      } 
+      // 其他状态按实际显示
+      else if (progressInfo.status === 'completed') {
+        displaySpeed = '已完成';
+      } else if (progressInfo.status === 'error') {
+        displaySpeed = '下载失败';
+      } else if (progressInfo.status === 'pending') {
+        displaySpeed = '等待中...';
+      }
+
+      // 4. 强制更新显示速度
+      progressInfo.speed = displaySpeed;
+      updateVideoProgress(progressInfo);
 
       // 完成后启用按钮
       if (data.status === 'completed' && data.completed >= data.total) {
@@ -255,14 +330,12 @@
       }
     });
 
-    // 修复进度条更新函数（直接操作保存的DOM）
+    // 更新进度条显示
     function updateVideoProgress(progressInfo) {
-      console.log('DOM是否存在于页面中:', document.body.contains(progressInfo.dom));
-      // 使用预存的DOM引用，避免通过ID查找失败
       const progressBar = progressInfo.dom;
       if (!progressBar) return;
 
-      // 计算状态样式
+      // 状态样式
       let barColor = '#00a1d6';
       let statusText = '下载中';
       if (progressInfo.status === 'completed') {
@@ -276,25 +349,45 @@
         statusText = '等待中';
       }
 
-      // 直接更新DOM元素（不重建整个HTML，避免引用丢失）
+      // 更新DOM
       progressBar.querySelector('.progress-title').innerHTML = `
         ${progressInfo.title}
         <span class="progress-percentage">${progressInfo.progress}% (${statusText})</span>
       `;
       progressBar.querySelector('.progress-bar-fill').style.width = `${progressInfo.progress}%`;
       progressBar.querySelector('.progress-bar-fill').style.backgroundColor = barColor;
+      progressBar.querySelector('.progress-speed').textContent = `速度：${progressInfo.speed}`;
       
-      // 显示错误信息（如果有）
+      // 错误信息
       const errorDiv = progressBar.querySelector('.error') || document.createElement('div');
       errorDiv.className = 'error';
       if (progressInfo.error) {
         errorDiv.textContent = `错误: ${progressInfo.error}`;
-        if (!progressBar.contains(errorDiv)) {
-          progressBar.appendChild(errorDiv);
-        }
+        if (!progressBar.contains(errorDiv)) progressBar.appendChild(errorDiv);
       } else if (progressBar.contains(errorDiv)) {
         progressBar.removeChild(errorDiv);
       }
+    }
+
+    function onDownloadCompleted(data) {
+    const history = JSON.parse(localStorage.getItem('downloadHistory') || '[]');
+  
+    // 构造历史记录项
+    const record = {
+      taskId: data.task_id,
+      url: data.current_url,
+      quality: data.quality,    // 从任务状态取
+      title: data.title,
+      time: new Date().getTime(),
+      status: 'success'
+    };
+  
+    // 存到本地
+    history.push(record);
+    localStorage.setItem('downloadHistory', JSON.stringify(history));
+  
+    // 渲染历史列表
+    renderHistory(history);
     }
   </script>
 </body>
